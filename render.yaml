@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: banabudgetai-api
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: ADMIN_SECRET_KEY
+        value: BanaBumpKey2026!
+      - key: DEVELOPER_EMAIL
+        value: banabudgetai@gmail.com
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
