@@ -169,20 +169,145 @@ DEVELOPER_EMAIL   = os.getenv("DEVELOPER_EMAIL", "banabudgetai@gmail.com")
 # ── Version Config — UPDATE THESE when releasing a new version ────────────────
 # minimum_version: users below this are FORCED to update (blocking modal)
 # latest_version:  current latest version shown in update prompt
-APP_VERSION_CONFIG = {
-    "minimum_version": "1.9.3",   # ← bump this to force update
-    "latest_version":  "1.9.3",
+VERSION_CONFIG_FILE = "/tmp/bana_version.json"
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.banaai.budgetapp"
+
+DEFAULT_VERSION_CONFIG = {
+    "minimum_version": "1.9.0",
+    "latest_version":  "1.9.6",
     "force_update":    True,
-    "update_message":  "A new version of Bana Budget AI is available with exciting new features and important improvements. Please update to continue.",
-    "play_store_url":  "https://play.google.com/store/apps/details?id=com.banaai.budgetapp",
+    "update_message":  "A new version of Bana Budget AI is available. Please update to continue.",
+    "play_store_url":  PLAY_STORE_URL,
     "whats_new": [
-        "Bank-grade signup with email verification",
-        "4-digit PIN & biometric quick-login",
-        "Edit buttons on bank accounts, assets & goals",
-        "Auto-backup so data is never lost on updates",
-        "Adaptive Security AI with real-time threat protection",
+        "Auto-update notifications",
+        "Edit & custom buttons fixed across the app",
+        "Bank SMS quick-setup",
+        "Hardened SMS security & privacy",
     ]
 }
+
+def load_version_config() -> dict:
+    """Load persisted version config from disk; fall back to default."""
+    try:
+        if os.path.exists(VERSION_CONFIG_FILE):
+            with open(VERSION_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return {**DEFAULT_VERSION_CONFIG, **json.load(f)}
+    except Exception as e:
+        print(f"[VERSION] Load failed: {e}")
+    return DEFAULT_VERSION_CONFIG.copy()
+
+def save_version_config(config: dict) -> None:
+    """Persist version config so it survives Render redeploys."""
+    try:
+        with open(VERSION_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+    except Exception as e:
+        print(f"[VERSION] Save failed: {e}")
+
+APP_VERSION_CONFIG = load_version_config()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLAY STORE AUTO-POLLER — scrapes the Play Store every hour to detect new
+# releases automatically, no manual bump needed.
+# ─────────────────────────────────────────────────────────────────────────────
+def _push_update_notification(version: str) -> int:
+    """Push 'update available' to all registered devices. Returns count sent."""
+    if not push_tokens:
+        return 0
+    messages = [
+        {
+            'to': t,
+            'title': f'🚀 Update Available — v{version}',
+            'body': 'A new version of Bana Budget AI is ready. Tap to update.',
+            'priority': 'high',
+            'data': {'type': 'app_update', 'version': version},
+        }
+        for t in list(push_tokens)
+    ]
+    try:
+        httpx.post(
+            'https://exp.host/--/api/v2/push/send',
+            json=messages,
+            headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        return len(messages)
+    except Exception as e:
+        print(f"[POLL] Push failed: {e}")
+        return 0
+
+def _semver_gt(a: str, b: str) -> bool:
+    """True if version `a` is greater than version `b` (e.g. '1.9.7' > '1.9.6')."""
+    try:
+        pa = [int(x) for x in a.split('.')[:3]]
+        pb = [int(x) for x in b.split('.')[:3]]
+        while len(pa) < 3: pa.append(0)
+        while len(pb) < 3: pb.append(0)
+        return pa > pb
+    except Exception:
+        return False
+
+def poll_play_store() -> None:
+    """Fetch Play Store page, extract version, auto-bump + notify if newer."""
+    try:
+        r = httpx.get(PLAY_STORE_URL, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code != 200:
+            print(f"[POLL] Play Store returned {r.status_code}")
+            return
+        # Extract version from Play Store HTML
+        # Pattern in HTML: [[["1.9.7"]]] or "Current Version"...">1.9.7<"
+        patterns = [
+            r'\[\["([0-9]+\.[0-9]+\.[0-9]+)"\]\]',
+            r'Current Version[^>]+>([0-9]+\.[0-9]+\.[0-9]+)<',
+            r'"versionName":"([0-9]+\.[0-9]+\.[0-9]+)"',
+            r'>([0-9]+\.[0-9]+\.[0-9]+)<\/span>\s*<\/div>\s*<div[^>]*>Current Version',
+        ]
+        latest_from_store = None
+        for p in patterns:
+            m = re.search(p, r.text)
+            if m:
+                latest_from_store = m.group(1)
+                break
+        if not latest_from_store:
+            print("[POLL] Could not extract version from Play Store HTML")
+            return
+
+        current = APP_VERSION_CONFIG.get('latest_version', '0.0.0')
+        if _semver_gt(latest_from_store, current):
+            print(f"[POLL] New version detected: {current} → {latest_from_store}")
+            APP_VERSION_CONFIG['latest_version']  = latest_from_store
+            APP_VERSION_CONFIG['minimum_version'] = latest_from_store
+            APP_VERSION_CONFIG['force_update']    = True
+            APP_VERSION_CONFIG['update_message']  = f"Bana Budget AI v{latest_from_store} is now available with improvements. Please update."
+            save_version_config(APP_VERSION_CONFIG)
+            count = _push_update_notification(latest_from_store)
+            print(f"[POLL] Auto-bumped to v{latest_from_store}, notified {count} devices")
+        else:
+            print(f"[POLL] OK — current {current}, Play Store {latest_from_store}")
+    except Exception as e:
+        print(f"[POLL] Error: {e}")
+
+def _poll_loop() -> None:
+    """Background thread: poll every hour, with first check after 30s of startup."""
+    time.sleep(30)  # let server fully boot
+    while True:
+        poll_play_store()
+        time.sleep(3600)  # 1 hour
+
+# Start the poller in a daemon thread on server startup
+_poll_thread = threading.Thread(target=_poll_loop, daemon=True, name='play-store-poller')
+_poll_thread.start()
+print(f"[POLL] Play Store auto-poller started — checks every hour")
+
+# Manual trigger endpoint for testing
+@app.post("/api/admin/poll-play-store")
+def trigger_poll():
+    admin_key = request.headers.get('X-Admin-Key', '')
+    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
+    if not hmac.compare_digest(admin_key, expected):
+        return jsonify({'error': 'Unauthorized'}), 401
+    threading.Thread(target=poll_play_store, daemon=True).start()
+    return jsonify({'success': True, 'message': 'Poll triggered — check server logs'})
 
 # ── Auto-Update Webhook: Play Console can call this to bump versions ───────
 @app.post("/api/admin/bump-version")
@@ -218,6 +343,9 @@ def bump_version():
         APP_VERSION_CONFIG['force_update'] = bool(data['force_update'])
     if data.get('update_message'):
         APP_VERSION_CONFIG['update_message'] = data['update_message']
+
+    # Persist to disk so it survives redeploys
+    save_version_config(APP_VERSION_CONFIG)
 
     # Auto-push notification to all registered devices
     if data.get('notify', True) and push_tokens:
