@@ -596,6 +596,41 @@ def send_otp_email(email: str, otp: str) -> bool:
         print(f"[OTP] Email error: {e}")
         return False
 
+@app.post("/api/admin/test-smtp")
+def test_smtp():
+    """Debug: synchronously try SMTP and return actual error. Protected by admin key."""
+    admin_key = request.headers.get('X-Admin-Key', '')
+    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
+    if not hmac.compare_digest(admin_key, expected):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get('email') or DEVELOPER_EMAIL).strip()
+
+    debug = {
+        'smtp_host': SMTP_HOST,
+        'smtp_port': SMTP_PORT,
+        'smtp_user': SMTP_USER if SMTP_USER else '(not set)',
+        'smtp_pass_set': bool(SMTP_PASS),
+        'smtp_pass_len': len(SMTP_PASS) if SMTP_PASS else 0,
+        'to': to_email,
+    }
+    if not SMTP_USER or not SMTP_PASS:
+        return jsonify({'success': False, 'error': 'SMTP_USER or SMTP_PASS missing', 'debug': debug})
+
+    try:
+        msg = MIMEText('Test email from Bana Budget AI server SMTP check.')
+        msg['Subject'] = 'Bana Budget AI — SMTP Test'
+        msg['From']    = SMTP_USER
+        msg['To']      = to_email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        return jsonify({'success': True, 'message': f'Test email sent to {to_email}', 'debug': debug})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'error_type': type(e).__name__, 'debug': debug})
+
 @app.post("/api/send-otp")
 @secure_endpoint
 def send_otp():
