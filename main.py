@@ -571,30 +571,71 @@ CHAT LOG
 import random
 otp_store = {}  # email -> {otp, expires}
 
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM    = os.getenv("RESEND_FROM", "Bana Budget AI <onboarding@resend.dev>")
+
 def send_otp_email(email: str, otp: str) -> bool:
-    if not SMTP_USER or not SMTP_PASS:
-        print(f"[OTP] No SMTP configured — OTP for {email}: {otp}")
-        return False  # tell client so it uses local fallback
-    try:
-        msg = MIMEText(
-            f"Your Bana Budget AI verification code is:\n\n"
-            f"   {otp}\n\n"
-            f"This code expires in 10 minutes.\n\n"
-            f"If you didn't request this, please ignore this email.\n\n"
-            f"— Bana Budget AI Team\nbanabudgetai@gmail.com"
-        )
-        msg["Subject"] = f"Bana Budget AI — Verification Code {otp}"
-        msg["From"]    = SMTP_USER
-        msg["To"]      = email
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        print(f"[OTP] Sent to {email}")
-        return True
-    except Exception as e:
-        print(f"[OTP] Email error: {e}")
-        return False
+    # Preferred: Resend HTTPS API (works on Render free tier)
+    if RESEND_API_KEY:
+        try:
+            r = httpx.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": RESEND_FROM,
+                    "to": [email],
+                    "subject": f"Bana Budget AI — Your verification code: {otp}",
+                    "text": (
+                        f"Hi,\n\n"
+                        f"Your Bana Budget AI verification code is:\n\n"
+                        f"        {otp}\n\n"
+                        f"This code expires in 10 minutes.\n\n"
+                        f"If you didn't request this, please ignore this email.\n\n"
+                        f"— Bana Budget AI Team"
+                    ),
+                    "html": (
+                        f"<div style='font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px'>"
+                        f"<h2 style='color:#8b1538'>Bana Budget AI</h2>"
+                        f"<p>Hi,</p>"
+                        f"<p>Your verification code is:</p>"
+                        f"<div style='font-size:32px;font-weight:bold;letter-spacing:8px;background:#f5f5f5;padding:16px;text-align:center;border-radius:8px;margin:16px 0'>{otp}</div>"
+                        f"<p style='color:#666;font-size:13px'>This code expires in <b>10 minutes</b>.</p>"
+                        f"<p style='color:#999;font-size:12px'>If you didn't request this, please ignore this email.</p>"
+                        f"<hr style='border:none;border-top:1px solid #eee;margin:24px 0'/>"
+                        f"<p style='color:#aaa;font-size:11px'>— Bana Budget AI Team</p>"
+                        f"</div>"
+                    ),
+                },
+                timeout=15,
+            )
+            if r.status_code in (200, 202):
+                print(f"[OTP] Resend → {email} OK")
+                return True
+            print(f"[OTP] Resend failed: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"[OTP] Resend error: {e}")
+
+    # Fallback: SMTP (won't work on Render free tier)
+    if SMTP_USER and SMTP_PASS:
+        try:
+            msg = MIMEText(f"Your Bana Budget AI verification code is: {otp}\n\nExpires in 10 minutes.")
+            msg["Subject"] = f"Bana Budget AI — Verification Code {otp}"
+            msg["From"]    = SMTP_USER
+            msg["To"]      = email
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.starttls()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+            print(f"[OTP] SMTP → {email} OK")
+            return True
+        except Exception as e:
+            print(f"[OTP] SMTP error: {e}")
+
+    print(f"[OTP] No email service configured — OTP for {email}: {otp}")
+    return False
 
 @app.post("/api/admin/test-smtp")
 def test_smtp():
