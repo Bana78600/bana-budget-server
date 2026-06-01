@@ -573,8 +573,8 @@ otp_store = {}  # email -> {otp, expires}
 
 def send_otp_email(email: str, otp: str) -> bool:
     if not SMTP_USER or not SMTP_PASS:
-        print(f"[OTP] No SMTP — OTP for {email}: {otp}")
-        return True  # dev mode: still allow flow
+        print(f"[OTP] No SMTP configured — OTP for {email}: {otp}")
+        return False  # tell client so it uses local fallback
     try:
         msg = MIMEText(
             f"Your Bana Budget AI verification code is:\n\n"
@@ -608,9 +608,16 @@ def send_otp():
     otp_store[email] = {"otp": otp, "expires": time.time() + 600}  # 10 min
     sent = send_otp_email(email, otp)
 
+    if sent:
+        return jsonify({
+            "success": True,
+            "message": "Verification code sent to your email",
+        })
+    # SMTP not configured — return the OTP to the client so it shows it in app
     return jsonify({
-        "success": sent,
-        "message": "Verification code sent to your email" if sent else "Could not send code",
+        "success": False,
+        "error": "Email service not configured — using local code",
+        "local_otp": otp,
     })
 
 @app.post("/api/verify-otp")
