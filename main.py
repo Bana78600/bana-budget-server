@@ -606,18 +606,20 @@ def send_otp():
 
     otp = f"{random.randint(0, 999999):06d}"
     otp_store[email] = {"otp": otp, "expires": time.time() + 600}  # 10 min
-    sent = send_otp_email(email, otp)
 
-    if sent:
+    if not SMTP_USER or not SMTP_PASS:
+        print(f"[OTP] No SMTP configured — OTP for {email}: {otp}")
         return jsonify({
-            "success": True,
-            "message": "Verification code sent to your email",
+            "success": False,
+            "error": "Email service not configured — using local code",
+            "local_otp": otp,
         })
-    # SMTP not configured — return the OTP to the client so it shows it in app
+
+    # Send email in background thread so the endpoint returns immediately
+    threading.Thread(target=send_otp_email, args=(email, otp), daemon=True).start()
     return jsonify({
-        "success": False,
-        "error": "Email service not configured — using local code",
-        "local_otp": otp,
+        "success": True,
+        "message": "Verification code sent to your email",
     })
 
 @app.post("/api/verify-otp")
