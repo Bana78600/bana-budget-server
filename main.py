@@ -375,8 +375,27 @@ def bump_version():
         'notified_devices': len(push_tokens),
     })
 
-# ── Push token store (in-memory; use a DB in production) ──────────────────────
-push_tokens = set()  # stores Expo push tokens
+# ── Push token store: persist to disk so they survive Render redeploys ──────
+PUSH_TOKENS_FILE = "/tmp/bana_push_tokens.json"
+
+def load_push_tokens() -> set:
+    try:
+        if os.path.exists(PUSH_TOKENS_FILE):
+            with open(PUSH_TOKENS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+    except Exception as e:
+        print(f"[PUSH] Load failed: {e}")
+    return set()
+
+def save_push_tokens() -> None:
+    try:
+        with open(PUSH_TOKENS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(push_tokens), f)
+    except Exception as e:
+        print(f"[PUSH] Save failed: {e}")
+
+push_tokens = load_push_tokens()
+print(f"[PUSH] Loaded {len(push_tokens)} persisted push token(s)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEALTH CHECK
@@ -420,6 +439,7 @@ def register_token():
     if not token or not token.startswith("ExponentPushToken"):
         return jsonify({"error": "Invalid Expo push token"}), 400
     push_tokens.add(token)
+    save_push_tokens()  # persist immediately so it survives restarts
     print(f"[PUSH] Registered token: {token} | Total devices: {len(push_tokens)}")
     return jsonify({"success": True, "registered_devices": len(push_tokens)})
 
