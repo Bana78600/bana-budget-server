@@ -10,7 +10,8 @@ Endpoints:
   POST /api/bug-report          → Email bug report to developer
 """
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, abort, send_file
+import io as _io
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os, json, re, smtplib, threading, httpx, hashlib, hmac, time
@@ -818,6 +819,143 @@ def rule_based_insights(d: dict) -> list:
     out.append("💡 Tip: review subscriptions and eating-out costs first — these usually have the biggest easy savings.")
     out.append("🎯 Stay consistent: even small savings each week compound into big results over a year.")
     return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FBR IT-3 EXCEL FORM GENERATOR — fills the official FBR template
+# ─────────────────────────────────────────────────────────────────────────────
+IT3_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "it3_template.xls")
+
+@app.post("/api/fbr/generate-it3")
+@secure_endpoint
+def generate_it3_xls():
+    """
+    Fill the official FBR IT-3 Excel template with user profile + tax credits.
+    Returns the filled .xls as a downloadable file.
+
+    Body: {
+      "profile": { "ntn": "1234567", "cnic": "12345-1234567-1", "name": "...",
+                   "designation": "...", "postingCity": "...", "department": "...",
+                   "section": "...", "employeeNo": "...", "employerNtn": "...",
+                   "employerName": "...", "taxYear": "2025" },
+      "credits": [
+        { "category": "mobile", "identifier": "0300-...", "taxAmount": 1500, ... }
+      ]
+    }
+    """
+    try:
+        import xlrd
+        from xlutils.copy import copy as xl_copy
+        from xlwt import easyxf
+    except ImportError as e:
+        return jsonify({"error": f"Server missing Excel libraries: {e}"}), 500
+
+    data = request.get_json(silent=True) or {}
+    profile = data.get("profile") or {}
+    credits = data.get("credits") or []
+
+    if not os.path.exists(IT3_TEMPLATE_PATH):
+        return jsonify({"error": "IT-3 template missing on server"}), 500
+
+    # Open template + copy for writing
+    book_rd = xlrd.open_workbook(IT3_TEMPLATE_PATH, formatting_info=True)
+    book_wr = xl_copy(book_rd)
+    sheet   = book_wr.get_sheet(0)
+
+    # Styles
+    bold_input = easyxf('font: bold on, height 200, colour_index 0x0C;')
+
+    # ── HEADER FIELDS — cell positions discovered via xlrd cell-map ──
+    # NTN (R5, cols after C5)
+    sheet.write(5, 5,  str(profile.get("ntn", "")),       bold_input)
+    # Tax Year (R5, cols after C28)
+    sheet.write(5, 28, str(profile.get("taxYear", "")),   bold_input)
+    # CNIC (3 parts) — single field for simplicity
+    sheet.write(7, 5,  str(profile.get("cnic", "")),      bold_input)
+    # Employee No (R7, cols after C28)
+    sheet.write(7, 28, str(profile.get("employeeNo", "")),bold_input)
+    # Employee Name (R9, cols after C5)
+    sheet.write(9, 5,  str(profile.get("name", "")),      bold_input)
+    # Designation (R11) + Posting City
+    sheet.write(11, 5,  str(profile.get("designation", "")), bold_input)
+    sheet.write(11, 28, str(profile.get("postingCity", "")), bold_input)
+    # Department / Section
+    sheet.write(13, 5,  str(profile.get("department", "")), bold_input)
+    sheet.write(13, 28, str(profile.get("section", "")),    bold_input)
+    # Employer NTN + Name
+    sheet.write(15, 5,  str(profile.get("employerNtn", "")),  bold_input)
+    sheet.write(15, 19, str(profile.get("employerName", "")), bold_input)
+
+    # ── TAX CREDITS — categorise into the 4 fixed rows + 2 multi-row sections ──
+    # Row layout in the template:
+    #   R31 = Mobile Phone Bill         (3 columns: 1st, 2nd, 3rd)
+    #   R32 = Motor Vehicle Tax
+    #   R33 = Cash Withdrawal
+    #   R34 = Profit on Debt
+    #   R35-R37 = Electricity (consumer/CNIC/name) — 3 columns
+    #   R38-R40 = Telephone   (number/CNIC/name)   — 3 columns
+    #
+    # Each "column" maps to slot 1/2/3 → spreadsheet cols 10, 18, 26
+    SLOT_COLS = [10, 18, 26]   # 1st, 2nd, 3rd
+    TAX_COL   = 34             # Amount of Tax Credit Claimed
+
+    # Group credits by category
+    grouped = { 'mobile': [], 'vehicle': [], 'cash': [], 'profit': [],
+                'electricity': [], 'telephone': [] }
+    for c in credits:
+        cat = c.get('category')
+        if cat in grouped:
+            grouped[cat].append(c)
+
+    def fill_simple(row: int, items: list):
+        """Fill one row (mobile/vehicle/cash/profit) with up to 3 IDs + tax sum."""
+        total = 0
+        for i, item in enumerate(items[:3]):
+            sheet.write(row, SLOT_COLS[i], str(item.get('identifier', '')), bold_input)
+            total += float(item.get('taxAmount') or 0)
+        if total > 0:
+            sheet.write(row, TAX_COL, total, bold_input)
+
+    def fill_owner_block(row_start: int, items: list):
+        """Fill Electricity/Telephone — 3 rows × up to 3 columns + tax."""
+        # Row N   = identifier (consumer/phone number)
+        # Row N+1 = owner CNIC/NTN
+        # Row N+2 = owner name
+        total = 0
+        for i, item in enumerate(items[:3]):
+            sheet.write(row_start,     SLOT_COLS[i], str(item.get('identifier', '')), bold_input)
+            sheet.write(row_start + 1, SLOT_COLS[i], str(item.get('ownerCnic',  '')), bold_input)
+            sheet.write(row_start + 2, SLOT_COLS[i], str(item.get('ownerName',  '')), bold_input)
+            total += float(item.get('taxAmount') or 0)
+        if total > 0:
+            sheet.write(row_start, TAX_COL, total, bold_input)
+
+    fill_simple(31, grouped['mobile'])
+    fill_simple(32, grouped['vehicle'])
+    fill_simple(33, grouped['cash'])
+    fill_simple(34, grouped['profit'])
+    fill_owner_block(35, grouped['electricity'])
+    fill_owner_block(38, grouped['telephone'])
+
+    # ── TOTAL CLAIM ──
+    grand_total = sum(float(c.get('taxAmount') or 0) for c in credits)
+    sheet.write(41, 34, grand_total, bold_input)
+
+    # ── DATE (employee signature line) ──
+    from datetime import datetime as _dt
+    sheet.write(45, 3, _dt.utcnow().strftime('%d-%b-%Y'), bold_input)
+
+    # Serialise to bytes and return
+    buf = _io.BytesIO()
+    book_wr.save(buf)
+    buf.seek(0)
+
+    filename = f"FBR_IT-3_{(profile.get('name') or 'employee').replace(' ', '_')}_{profile.get('taxYear', '')}.xls"
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/vnd.ms-excel',
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUG REPORT → EMAIL
