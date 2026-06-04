@@ -670,6 +670,156 @@ def chat():
     return jsonify({"reply": reply, "is_bug_report": is_bug, "suggested_actions": ["Contact Developer"] if is_bug else []})
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AI SPENDING INSIGHTS — Claude analyses transactions vs historical + inflation
+# ─────────────────────────────────────────────────────────────────────────────
+INSIGHTS_SYSTEM = """You are a personal finance AI advisor for Bana Budget AI users.
+You analyse a user's spending data and produce SHORT, ACTIONABLE insights.
+
+RULES:
+- Output 4-6 bullet points, each max 25 words.
+- Compare current period to prior periods using the numbers provided.
+- Flag categories that are >20% above their average — call these "critical".
+- Suggest 2-3 specific actions to save money in the most-overspent category.
+- Consider local context (inflation, country) where mentioned.
+- Use the user's currency symbol.
+- End with one motivational tip.
+- Use emojis: 🚨 critical, 📈 rising, 💡 tip, 🎯 goal.
+"""
+
+@app.post("/api/insights")
+@secure_endpoint
+def insights():
+    """
+    Analyse user's spending vs historical & inflation. Returns AI insights.
+
+    Body: {
+      "currency": "QAR",
+      "country": "Qatar",
+      "current_period": { "label": "This Month", "total": 4500, "by_category": {"food": 1200, ...} },
+      "prior_periods": [
+        { "label": "Last Month",  "total": 3800, "by_category": {...} },
+        { "label": "Last Quarter Avg", "total": 4000, "by_category": {...} },
+        { "label": "Last Year Avg", "total": 3500, "by_category": {...} },
+      ],
+      "budgets":  { "food": 1000, "transport": 500 },
+      "goals":    [ { "name": "Vacation", "target": 5000, "saved": 1200 } ]
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Bad payload"}), 400
+
+    if not ANTHROPIC_API_KEY:
+        # Fallback: simple rule-based insights
+        return jsonify({
+            "summary":  "AI is offline; here are basic stats based on your data.",
+            "insights": rule_based_insights(data),
+        })
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Build a compact, structured prompt
+        prompt = build_insights_prompt(data)
+        resp = client.messages.create(
+            model="claude-haiku-3-5",
+            max_tokens=600,
+            system=INSIGHTS_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # Split into bullet-list
+        lines = [l.strip().lstrip('-•●').strip() for l in text.split('\n') if l.strip() and not l.strip().startswith('#')]
+        return jsonify({
+            "summary":  "AI-generated insights for your spending",
+            "insights": lines[:8],
+        })
+    except Exception as e:
+        print(f"[INSIGHTS] Claude error: {e}")
+        return jsonify({
+            "summary":  "Using rule-based analysis (AI temporarily unavailable).",
+            "insights": rule_based_insights(data),
+        })
+
+def build_insights_prompt(d: dict) -> str:
+    """Compact prompt for Claude."""
+    cur     = d.get("current_period", {})
+    priors  = d.get("prior_periods", []) or []
+    bdgts   = d.get("budgets", {}) or {}
+    goals   = d.get("goals", []) or []
+    curr    = d.get("currency", "USD")
+    country = d.get("country", "Global")
+
+    lines = [
+        f"User country: {country}",
+        f"Currency: {curr}",
+        f"",
+        f"Current period ({cur.get('label', '')}): total {curr} {cur.get('total', 0):.0f}",
+        "  Categories:",
+    ]
+    for cat, amt in (cur.get("by_category", {}) or {}).items():
+        lines.append(f"    {cat}: {curr} {amt:.0f}")
+    lines.append("")
+    for p in priors[:3]:
+        lines.append(f"{p.get('label', '')}: total {curr} {p.get('total', 0):.0f}")
+        for cat, amt in (p.get("by_category", {}) or {}).items():
+            lines.append(f"    {cat}: {curr} {amt:.0f}")
+        lines.append("")
+    if bdgts:
+        lines.append("Active budgets:")
+        for cat, lim in bdgts.items():
+            spent = (cur.get("by_category", {}) or {}).get(cat, 0)
+            pct = (spent / lim * 100) if lim else 0
+            lines.append(f"    {cat}: {curr} {spent:.0f} of {curr} {lim:.0f} ({pct:.0f}%)")
+    if goals:
+        lines.append("")
+        lines.append("Savings goals:")
+        for g in goals[:3]:
+            lines.append(f"    {g.get('name', '')}: saved {curr} {g.get('saved', 0):.0f} of {curr} {g.get('target', 0):.0f}")
+    lines.append("")
+    lines.append(
+        "Provide 4-6 short bullets: which categories are over budget or growing fastest, "
+        "what the user can cut to save money, and one motivational tip."
+    )
+    return "\n".join(lines)
+
+def rule_based_insights(d: dict) -> list:
+    """Fallback when AI is offline — basic deterministic analysis."""
+    out  = []
+    cur  = d.get("current_period", {}) or {}
+    curr = d.get("currency", "USD")
+    by   = cur.get("by_category", {}) or {}
+    bdgts = d.get("budgets", {}) or {}
+    total = cur.get("total", 0)
+
+    # Top category
+    if by:
+        top_cat, top_amt = max(by.items(), key=lambda kv: kv[1])
+        out.append(f"📈 Top spending category: {top_cat} at {curr} {top_amt:.0f} ({(top_amt/total*100):.0f}% of total)")
+
+    # Over budget
+    for cat, lim in bdgts.items():
+        spent = by.get(cat, 0)
+        if lim and spent > lim:
+            over = spent - lim
+            out.append(f"🚨 {cat} over budget by {curr} {over:.0f} ({(spent/lim*100):.0f}%) — try to cut back")
+
+    # Prior comparison
+    priors = d.get("prior_periods", [])
+    if priors:
+        prior = priors[0]
+        prior_total = prior.get("total", 0)
+        if prior_total > 0:
+            diff = total - prior_total
+            pct  = (diff / prior_total * 100) if prior_total else 0
+            sign = "+" if diff > 0 else ""
+            out.append(f"📊 vs {prior.get('label','')}: {sign}{curr} {diff:.0f} ({sign}{pct:.0f}%)")
+
+    out.append("💡 Tip: review subscriptions and eating-out costs first — these usually have the biggest easy savings.")
+    out.append("🎯 Stay consistent: even small savings each week compound into big results over a year.")
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUG REPORT → EMAIL
 # ─────────────────────────────────────────────────────────────────────────────
 def send_email_async(ticket_id: str, report: dict):
