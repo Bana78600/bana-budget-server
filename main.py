@@ -174,16 +174,16 @@ VERSION_CONFIG_FILE = "/tmp/bana_version.json"
 PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.banaai.budgetapp"
 
 DEFAULT_VERSION_CONFIG = {
-    "minimum_version": "1.9.0",
-    "latest_version":  "1.9.6",
-    "force_update":    True,
-    "update_message":  "A new version of Bana Budget AI is available. Please update to continue.",
+    "minimum_version": "2.2.4",
+    "latest_version":  "2.3.0",
+    "force_update":    False,
+    "update_message":  "Bana Budget AI v2.3.0 — Setup Wizard + Help button on home screen.",
     "play_store_url":  PLAY_STORE_URL,
     "whats_new": [
-        "Auto-update notifications",
-        "Edit & custom buttons fixed across the app",
-        "Bank SMS quick-setup",
-        "Hardened SMS security & privacy",
+        "First-run Setup Wizard guides new users",
+        "Help (?) button on home screen",
+        "Replay tutorial or setup wizard anytime",
+        "AI Help Chat from home screen",
     ]
 }
 
@@ -1119,19 +1119,28 @@ def send_otp():
     otp = f"{random.randint(0, 999999):06d}"
     otp_store[email] = {"otp": otp, "expires": time.time() + 600}  # 10 min
 
-    if not SMTP_USER or not SMTP_PASS:
-        print(f"[OTP] No SMTP configured — OTP for {email}: {otp}")
+    # No email service at all — return local OTP for in-app display
+    if not RESEND_API_KEY and not (SMTP_USER and SMTP_PASS):
+        print(f"[OTP] No email service configured — OTP for {email}: {otp}")
         return jsonify({
-            "success": False,
-            "error": "Email service not configured — using local code",
+            "success": True,
+            "message": "Email service unavailable — use this code:",
             "local_otp": otp,
         })
 
-    # Send email in background thread so the endpoint returns immediately
-    threading.Thread(target=send_otp_email, args=(email, otp), daemon=True).start()
+    # Send SYNCHRONOUSLY so we know if delivery actually succeeded.
+    # On failure, return the local OTP so the user can still proceed.
+    sent = send_otp_email(email, otp)
+    if sent:
+        return jsonify({
+            "success": True,
+            "message": "Verification code sent to your email",
+        })
+    print(f"[OTP] Email delivery FAILED — returning local OTP for {email}")
     return jsonify({
         "success": True,
-        "message": "Verification code sent to your email",
+        "message": "Email service had a hiccup — use this code:",
+        "local_otp": otp,
     })
 
 @app.post("/api/verify-otp")
