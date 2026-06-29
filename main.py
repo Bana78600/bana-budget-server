@@ -1119,29 +1119,32 @@ def send_otp():
     otp = f"{random.randint(0, 999999):06d}"
     otp_store[email] = {"otp": otp, "expires": time.time() + 600}  # 10 min
 
-    # No email service at all — return local OTP for in-app display
+    # SECURITY: Never return the OTP in the response body. Doing so would let
+    # any caller harvest OTPs for arbitrary emails just by hitting this endpoint
+    # whenever the email service is degraded. Always require successful delivery.
     if not RESEND_API_KEY and not (SMTP_USER and SMTP_PASS):
-        print(f"[OTP] No email service configured — OTP for {email}: {otp}")
+        # Drop the in-memory OTP so it can't be verified — defense in depth
+        otp_store.pop(email, None)
+        print(f"[OTP] No email service configured — refusing request for {email}")
         return jsonify({
-            "success": True,
-            "message": "Email service unavailable — use this code:",
-            "local_otp": otp,
-        })
+            "success": False,
+            "error": "Email service is temporarily unavailable. Please try again in a few minutes.",
+        }), 503
 
-    # Send SYNCHRONOUSLY so we know if delivery actually succeeded.
-    # On failure, return the local OTP so the user can still proceed.
     sent = send_otp_email(email, otp)
     if sent:
         return jsonify({
             "success": True,
             "message": "Verification code sent to your email",
         })
-    print(f"[OTP] Email delivery FAILED — returning local OTP for {email}")
+
+    # Delivery failed — drop the OTP and tell the client
+    otp_store.pop(email, None)
+    print(f"[OTP] Email delivery FAILED for {email}")
     return jsonify({
-        "success": True,
-        "message": "Email service had a hiccup — use this code:",
-        "local_otp": otp,
-    })
+        "success": False,
+        "error": "We couldn't deliver your verification email. Please try again or contact support.",
+    }), 502
 
 @app.post("/api/verify-otp")
 @secure_endpoint
