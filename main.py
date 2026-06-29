@@ -38,11 +38,22 @@ blocked_ips: dict = {}      # ip → unblock_timestamp
 suspicious_log: list = []   # list of security events
 
 RATE_LIMITS = {
-    'default':        (30, 60),   # 30 requests per 60 seconds
-    '/api/parse-sms': (10, 60),   # 10 per minute
-    '/api/chat':      (20, 60),   # 20 per minute
+    'default':         (30, 60),    # 30 requests per 60 seconds
+    '/api/parse-sms':  (10, 60),    # 10 per minute
+    '/api/chat':       (20, 60),    # 20 per minute
     '/api/register-token': (5, 60), # 5 per minute
+    # OTP endpoints — strict to prevent abuse:
+    '/api/send-otp':   (5, 3600),   # 5 OTP requests per hour per IP
+    '/api/verify-otp': (15, 300),   # 15 verify attempts per 5 minutes per IP
 }
+
+# Per-email OTP tracking (defense against IP rotation):
+#   sent_email_count[email] -> {count, reset}  — cap OTPs sent per email
+#   verify_attempts[email]  -> {count, otp_issued_at} — invalidate OTP after N bad guesses
+otp_per_email_sent: dict = {}
+otp_per_email_verify: dict = {}
+OTP_SEND_PER_EMAIL_HOUR = 3      # max 3 OTPs to the same email per hour
+OTP_MAX_VERIFY_ATTEMPTS = 5      # invalidate OTP after 5 wrong guesses
 BLOCK_THRESHOLD = 100  # block IP after this many requests in 60s
 BLOCK_DURATION  = 3600 # 1 hour block
 
@@ -1116,8 +1127,23 @@ def send_otp():
     if "@" not in email or "." not in email:
         return jsonify({"success": False, "error": "Invalid email"}), 400
 
+    # Per-email rate limit (defense against IP rotation)
+    now = time.time()
+    em_entry = otp_per_email_sent.get(email)
+    if em_entry and now < em_entry['reset']:
+        if em_entry['count'] >= OTP_SEND_PER_EMAIL_HOUR:
+            log_security_event('otp_email_rate_limit', get_client_ip(), email)
+            return jsonify({
+                "success": False,
+                "error": "Too many verification codes requested for this email. Please try again later.",
+            }), 429
+        em_entry['count'] += 1
+    else:
+        otp_per_email_sent[email] = {'count': 1, 'reset': now + 3600}
+
     otp = f"{random.randint(0, 999999):06d}"
-    otp_store[email] = {"otp": otp, "expires": time.time() + 600}  # 10 min
+    otp_store[email] = {"otp": otp, "expires": now + 600}  # 10 min
+    otp_per_email_verify[email] = {'count': 0, 'otp_issued_at': now}
 
     # SECURITY: Never return the OTP in the response body. Doing so would let
     # any caller harvest OTPs for arbitrary emails just by hitting this endpoint
@@ -1158,11 +1184,25 @@ def verify_otp():
         return jsonify({"success": False, "error": "No code requested"}), 400
     if time.time() > entry["expires"]:
         otp_store.pop(email, None)
+        otp_per_email_verify.pop(email, None)
         return jsonify({"success": False, "error": "Code expired — please request a new one"}), 400
+
+    # Per-email brute-force protection: invalidate OTP after N wrong guesses
+    ve = otp_per_email_verify.setdefault(email, {'count': 0, 'otp_issued_at': time.time()})
     if otp != entry["otp"]:
+        ve['count'] += 1
+        if ve['count'] >= OTP_MAX_VERIFY_ATTEMPTS:
+            otp_store.pop(email, None)
+            otp_per_email_verify.pop(email, None)
+            log_security_event('otp_brute_force', get_client_ip(), email)
+            return jsonify({
+                "success": False,
+                "error": "Too many wrong attempts. Please request a new code.",
+            }), 429
         return jsonify({"success": False, "error": "Invalid code"}), 400
 
     otp_store.pop(email, None)
+    otp_per_email_verify.pop(email, None)
     return jsonify({"success": True, "message": "Email verified"})
 
 @app.post("/api/bug-report")
