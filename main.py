@@ -232,10 +232,9 @@ DEFAULT_VERSION_CONFIG = {
     "update_message":  "A new version of Bana Budget AI is available with important improvements. Please update to continue.",
     "play_store_url":  PLAY_STORE_URL,
     "whats_new": [
-        "First-run Setup Wizard guides new users",
-        "Help (?) button on home screen",
-        "Replay tutorial or setup wizard anytime",
-        "AI Help Chat from home screen",
+        "Performance and stability improvements",
+        "Security fixes",
+        "Bug fixes across budgets, goals and reports",
     ]
 }
 
