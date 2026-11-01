@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify, abort, send_file
 import io as _io
 from flask_cors import CORS
 from dotenv import load_dotenv
-import os, json, re, smtplib, threading, httpx, hashlib, hmac, time
+import os, json, re, smtplib, threading, httpx, hashlib, hmac, time, secrets
 from datetime import datetime, timedelta
 from collections import defaultdict
 from email.mime.text import MIMEText
@@ -45,6 +45,9 @@ RATE_LIMITS = {
     # OTP endpoints — strict to prevent abuse:
     '/api/send-otp':   (5, 3600),   # 5 OTP requests per hour per IP
     '/api/verify-otp': (15, 300),   # 15 verify attempts per 5 minutes per IP
+    # Crash reporting - generous enough for a real crash loop, tight enough that
+    # a hostile client cannot use us as a free pipe into the Notion workspace:
+    '/api/log-error':  (20, 300),   # 20 reports per 5 minutes per IP
 }
 
 # Per-email OTP tracking (defense against IP rotation):
@@ -57,9 +60,20 @@ OTP_MAX_VERIFY_ATTEMPTS = 5      # invalidate OTP after 5 wrong guesses
 BLOCK_THRESHOLD = 100  # block IP after this many requests in 60s
 BLOCK_DURATION  = 3600 # 1 hour block
 
-# ── Security: Request Signing ─────────────────────────────────────────────────
-REQUEST_SECRET = os.getenv("REQUEST_SECRET", "bana_secret_2026_do_not_share")
-MAX_REQUEST_AGE_SEC = 300  # 5 minutes
+# ── Request signing: intentionally not implemented ────────────────────────────
+# There used to be a REQUEST_SECRET here with a hardcoded fallback value, plus a
+# matching signRequest() in the app. Neither was ever called, so it gave the
+# appearance of replay protection without providing any — and the fallback meant
+# a secret sat in the source.
+#
+# It was removed rather than finished, because a shared secret shipped inside an
+# APK can be extracted by anyone who downloads the app, so signing with it would
+# not stop a determined attacker. Replay and abuse are handled by the controls
+# that do work: per-IP and per-email rate limits, IP blocking, single-use OTPs
+# with an attempt cap and a 10-minute expiry, and HTTPS everywhere.
+#
+# If signing is ever needed, it has to be built on a per-install credential
+# issued by the server, not a constant compiled into the client.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECURITY MIDDLEWARE
@@ -88,6 +102,27 @@ def is_ip_blocked(ip: str) -> bool:
 def block_ip(ip: str, reason: str):
     blocked_ips[ip] = time.time() + BLOCK_DURATION
     log_security_event('ip_blocked', ip, reason)
+
+def admin_authorized() -> bool:
+    """
+    True only when the request carries the configured admin key.
+
+    Fails closed. Each admin endpoint used to read
+    os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key'), so if the variable
+    was ever absent — a typo in the Render dashboard, a blueprint redeploy that
+    dropped it, a fresh environment — every admin endpoint silently began
+    accepting a value published in this file. Version bumps, forced updates, the
+    security log and IP unblocking all sit behind this check.
+
+    With no key configured there is nothing to authorize against, so nothing is
+    authorized, and the misconfiguration is logged rather than passed over.
+    """
+    expected = os.getenv('ADMIN_SECRET_KEY', '')
+    if not expected:
+        log_security_event('admin_key_not_configured', get_client_ip(),
+                           'ADMIN_SECRET_KEY unset - admin endpoints refused')
+        return False
+    return hmac.compare_digest(request.headers.get('X-Admin-Key', ''), expected)
 
 def check_rate_limit(ip: str, endpoint: str) -> bool:
     """Returns True if request is allowed, False if rate limited."""
@@ -184,11 +219,17 @@ DEVELOPER_EMAIL   = os.getenv("DEVELOPER_EMAIL", "banabudgetai@gmail.com")
 VERSION_CONFIG_FILE = "/tmp/bana_version.json"
 PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.banaai.budgetapp"
 
+# This is the floor, not the truth. /tmp is wiped on every Render cold start, so
+# whenever the free instance spins down the saved config is lost and the server
+# falls back to exactly these values — which is why a manual bump looked like it
+# "did not stick". Keep this in step with the live Play listing: it is what an
+# unpolled instance serves, and a value at or below the store version means no
+# user is ever prompted to update.
 DEFAULT_VERSION_CONFIG = {
-    "minimum_version": "2.2.4",
-    "latest_version":  "2.3.0",
-    "force_update":    False,
-    "update_message":  "Bana Budget AI v2.3.0 — Setup Wizard + Help button on home screen.",
+    "minimum_version": "2.6.1",
+    "latest_version":  "2.6.1",
+    "force_update":    True,
+    "update_message":  "A new version of Bana Budget AI is available with important improvements. Please update to continue.",
     "play_store_url":  PLAY_STORE_URL,
     "whats_new": [
         "First-run Setup Wizard guides new users",
@@ -299,10 +340,35 @@ def poll_play_store() -> None:
     except Exception as e:
         print(f"[POLL] Error: {e}")
 
+# When the last completed Play Store check happened, so an on-demand poll can be
+# rate-limited rather than hitting the listing on every launch.
+_last_poll_ts = 0.0
+_POLL_MIN_INTERVAL = 900  # 15 minutes
+
+def maybe_poll_play_store() -> None:
+    """
+    Start a Play Store check if the last one has gone stale.
+
+    The hourly thread is not enough on a free instance. It sleeps 30s before its
+    first check and an hour between checks, while Render spins the instance down
+    after roughly 15 minutes idle — so a low-traffic service can be killed before
+    the first check ever runs, every time, and the poller never observes a new
+    release. Letting a real request trigger the check means the version config
+    corrects itself on exactly the traffic that depends on it.
+    """
+    global _last_poll_ts
+    now = time.time()
+    if now - _last_poll_ts < _POLL_MIN_INTERVAL:
+        return
+    _last_poll_ts = now
+    threading.Thread(target=poll_play_store, daemon=True).start()
+
 def _poll_loop() -> None:
     """Background thread: poll every hour, with first check after 30s of startup."""
+    global _last_poll_ts
     time.sleep(30)  # let server fully boot
     while True:
+        _last_poll_ts = time.time()
         poll_play_store()
         time.sleep(3600)  # 1 hour
 
@@ -314,9 +380,7 @@ print(f"[POLL] Play Store auto-poller started — checks every hour")
 # Manual trigger endpoint for testing
 @app.post("/api/admin/poll-play-store")
 def trigger_poll():
-    admin_key = request.headers.get('X-Admin-Key', '')
-    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
-    if not hmac.compare_digest(admin_key, expected):
+    if not admin_authorized():
         return jsonify({'error': 'Unauthorized'}), 401
     threading.Thread(target=poll_play_store, daemon=True).start()
     return jsonify({'success': True, 'message': 'Poll triggered — check server logs'})
@@ -336,9 +400,7 @@ def bump_version():
       "notify": true                # if true, send push to all devices
     }
     """
-    admin_key = request.headers.get('X-Admin-Key', '')
-    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
-    if not hmac.compare_digest(admin_key, expected):
+    if not admin_authorized():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json(silent=True) or {}
@@ -437,6 +499,10 @@ def version_check():
     Returns version config. App compares its own version with minimum_version.
     If app_version < minimum_version → show force update modal.
     """
+    # Refresh from the Play listing in the background when the last check is
+    # stale. This request is answered from the config already in memory, so
+    # nothing blocks; the correction lands in time for the next launch.
+    maybe_poll_play_store()
     return jsonify(APP_VERSION_CONFIG)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1087,9 +1153,7 @@ def send_otp_email(email: str, otp: str) -> bool:
 @app.post("/api/admin/test-smtp")
 def test_smtp():
     """Debug: synchronously try SMTP and return actual error. Protected by admin key."""
-    admin_key = request.headers.get('X-Admin-Key', '')
-    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
-    if not hmac.compare_digest(admin_key, expected):
+    if not admin_authorized():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json(silent=True) or {}
@@ -1141,7 +1205,11 @@ def send_otp():
     else:
         otp_per_email_sent[email] = {'count': 1, 'reset': now + 3600}
 
-    otp = f"{random.randint(0, 999999):06d}"
+    # secrets, not random. random uses the Mersenne Twister, which is fully
+    # predictable once an attacker has observed enough of its output — someone
+    # able to request a run of codes to their own address could then work out the
+    # code issued to somebody else. secrets draws from the OS CSPRNG instead.
+    otp = f"{secrets.randbelow(1000000):06d}"
     otp_store[email] = {"otp": otp, "expires": now + 600}  # 10 min
     otp_per_email_verify[email] = {'count': 0, 'otp_issued_at': now}
 
@@ -1228,9 +1296,7 @@ def bug_report():
 @app.get("/api/admin/security")
 def security_dashboard():
     """View security log and blocked IPs. Protected by admin key."""
-    admin_key = request.headers.get('X-Admin-Key', '')
-    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
-    if not hmac.compare_digest(admin_key, expected):
+    if not admin_authorized():
         log_security_event('admin_access_denied', get_client_ip())
         return jsonify({'error': 'Unauthorized'}), 401
 
@@ -1244,9 +1310,7 @@ def security_dashboard():
 @app.post("/api/admin/unblock")
 def unblock_ip():
     """Unblock an IP. Protected by admin key."""
-    admin_key = request.headers.get('X-Admin-Key', '')
-    expected  = os.getenv('ADMIN_SECRET_KEY', 'change_this_admin_key')
-    if not hmac.compare_digest(admin_key, expected):
+    if not admin_authorized():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json(silent=True) or {}
@@ -1348,3 +1412,130 @@ if __name__ == "__main__":
     print(f"   AI: {'Claude enabled ✅' if ANTHROPIC_API_KEY else 'FAQ fallback mode'}")
     print(f"   Email: {'Configured ✅' if SMTP_PASS else 'Not configured ⚠️'}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+# ── Crash / error reporting → Notion ──────────────────────────────────────────
+# The app never talks to Notion directly. An integration token shipped inside an
+# APK can be extracted with `unzip` and a text editor, and would give the holder
+# write access to the workspace. The token lives here, server-side, and is never
+# returned to a client.
+NOTION_TOKEN       = os.getenv("NOTION_TOKEN", "")
+NOTION_ERROR_DB_ID = os.getenv("NOTION_ERROR_DB_ID", "b3cff9f2570041f49e63b14342b204e8")
+NOTION_API         = "https://api.notion.com/v1/pages"
+NOTION_VERSION     = "2022-06-28"
+
+# Notion caps a single rich_text value at 2000 characters. Longer stacks are
+# truncated rather than rejected — a truncated stack still names the failing
+# function, whereas a 400 from Notion loses the report entirely.
+NOTION_TEXT_CAP = 1900
+
+# Financial data must never leave the device. These patterns are stripped from
+# every field before anything is forwarded, as a second line of defence behind
+# the scrubbing the app already does. Belt and braces on purpose: a stack trace
+# can carry a variable value that the client-side scrubber did not anticipate.
+_MONEY_RE = re.compile(r'\b\d[\d,]*\.?\d*\s*(?:PKR|QAR|AED|SAR|USD|EUR|GBP|INR|Rs\.?)\b', re.I)
+_CURR_RE  = re.compile(r'\b(?:PKR|QAR|AED|SAR|USD|EUR|GBP|INR|Rs\.?)\s*\d[\d,]*\.?\d*\b', re.I)
+_ACCT_RE  = re.compile(r'\b\d{6,}\b')                 # account / card numbers
+_EMAIL_RE = re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.]+\b')
+_IBAN_RE  = re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b')
+
+def scrub_financial(s: str) -> str:
+    """Strip anything that could be money, an account number, or an identity."""
+    if not isinstance(s, str):
+        return ''
+    s = _IBAN_RE.sub('[IBAN]', s)
+    s = _MONEY_RE.sub('[AMOUNT]', s)
+    s = _CURR_RE.sub('[AMOUNT]', s)
+    s = _EMAIL_RE.sub('[EMAIL]', s)
+    s = _ACCT_RE.sub('[NUMBER]', s)
+    return s
+
+# Fields the client is allowed to send. Anything else is dropped rather than
+# forwarded — an allow-list, so a future app version cannot accidentally start
+# leaking a new field into Notion without this file changing too.
+_ALLOWED_ERROR_FIELDS = {
+    'message', 'stack', 'componentStack', 'screen', 'fatal',
+    'appVersion', 'versionCode', 'platform', 'osVersion',
+    'installId', 'occurredAt',
+}
+
+_SCREEN_OPTIONS = {'react-boundary', 'global', 'unknown'}
+
+def _rt(value: str) -> dict:
+    """A Notion rich_text property, capped to Notion's per-value limit."""
+    return {'rich_text': [{'text': {'content': (value or '')[:NOTION_TEXT_CAP]}}]}
+
+def _send_to_notion(event: dict) -> None:
+    """Fire-and-forget forward. Never raises into the request path."""
+    if not NOTION_TOKEN:
+        return
+    try:
+        screen = event.get('screen', 'unknown')
+        if screen not in _SCREEN_OPTIONS:
+            screen = 'unknown'
+
+        props = {
+            'Message':         {'title': [{'text': {'content': event.get('message', 'Unknown error')[:1900]}}]},
+            'Status':          {'select': {'name': 'New'}},
+            'Screen':          {'select': {'name': screen}},
+            'Fatal':           {'checkbox': bool(event.get('fatal'))},
+            'App Version':     _rt(str(event.get('appVersion', ''))),
+            'Version Code':    {'number': int(event.get('versionCode') or 0)},
+            'Platform':        {'select': {'name': 'android' if event.get('platform') != 'ios' else 'ios'}},
+            'OS Version':      _rt(str(event.get('osVersion', ''))),
+            'Install ID':      _rt(str(event.get('installId', ''))),
+            'Stack':           _rt(str(event.get('stack', ''))),
+            'Component Stack': _rt(str(event.get('componentStack', ''))),
+            'Occurrences':     {'number': 1},
+        }
+        occurred = event.get('occurredAt')
+        if occurred:
+            props['Occurred At'] = {'date': {'start': str(occurred)[:64]}}
+
+        httpx.post(
+            NOTION_API,
+            headers={
+                'Authorization':  f'Bearer {NOTION_TOKEN}',
+                'Notion-Version': NOTION_VERSION,
+                'Content-Type':   'application/json',
+            },
+            json={'parent': {'database_id': NOTION_ERROR_DB_ID}, 'properties': props},
+            timeout=10.0,
+        )
+    except Exception as e:
+        # Losing a crash report must never cascade into a server error.
+        print(f"[notion] forward failed: {type(e).__name__}")
+
+@app.post("/api/log-error")
+@secure_endpoint
+def log_error():
+    """
+    Accept one scrubbed crash report from the app and record it in Notion.
+
+    Always returns 200 on a well-formed request, even if Notion is unreachable.
+    The client must never retry a crash report in a loop — that is how a crash
+    loop becomes a self-inflicted denial of service.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'ok': True}), 200
+
+    event = {}
+    for key in _ALLOWED_ERROR_FIELDS:
+        if key not in data:
+            continue
+        val = data[key]
+        if isinstance(val, bool):
+            event[key] = val
+        elif isinstance(val, (int, float)):
+            event[key] = val
+        else:
+            cap = NOTION_TEXT_CAP if key in ('stack', 'componentStack') else 300
+            event[key] = scrub_financial(sanitize_string(str(val), cap))
+
+    if not event.get('message'):
+        return jsonify({'ok': True}), 200
+
+    # Deliberately NOT recorded: client IP, email, name, or any account data.
+    threading.Thread(target=_send_to_notion, args=(event,), daemon=True).start()
+    return jsonify({'ok': True}), 200

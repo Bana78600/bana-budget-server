@@ -1,0 +1,14 @@
+# Secrets — never commit. This repo deploys straight to Render, and there is no
+# .gitignore history here, so a single `git add .` would publish these keys to
+# GitHub.
+.env
+.env.*
+!.env.example
+
+# Render blueprint — keep env values in the Render dashboard, not in the repo.
+render.yaml
+
+# Local Python
+venv/
+__pycache__/
+*.pyc
